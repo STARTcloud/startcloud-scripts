@@ -1,0 +1,200 @@
+name: Development Build
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: 'Development version to build (optional - auto-calculated if not provided)'
+        required: false
+        type: string
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Development version to build (optional - auto-calculated if not provided)'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-development-packages:
+    name: Packages
+    runs-on: self-hosted
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set development version
+        id: version
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            DEV_VERSION="${{ inputs.version }}"
+            echo "Using provided version: $DEV_VERSION"
+          else
+            CURRENT_VERSION=$(cat version.txt)
+
+            IFS='.' read -ra VERSION_PARTS <<< "$CURRENT_VERSION"
+            MAJOR=${VERSION_PARTS[0]}
+            MINOR=${VERSION_PARTS[1]}
+            PATCH=${VERSION_PARTS[2]}
+
+            NEW_PATCH=$((PATCH + 1))
+            DEV_VERSION="${MAJOR}.${MINOR}.${NEW_PATCH}"
+
+            echo "Current version: $CURRENT_VERSION"
+            echo "Auto-calculated development version: $DEV_VERSION"
+          fi
+
+          echo "VERSION=$DEV_VERSION" >> $GITHUB_ENV
+          echo "PACKAGE_NAME=startcloud-scripts-dev" >> $GITHUB_ENV
+          echo "ARCH=amd64" >> $GITHUB_ENV
+
+      - name: Create Debian package structure
+        run: |
+          mkdir -p "${PACKAGE_NAME}_${VERSION}_${ARCH}"/{opt/prominic/bin,etc/cron.d,DEBIAN}
+
+      - name: Copy application files to Debian package
+        run: |
+          cp src/Snapshoter.sh "${PACKAGE_NAME}_${VERSION}_${ARCH}/opt/prominic/bin/"
+
+      - name: Copy configuration files to Debian package
+        run: |
+          cp packaging/cron/snapshoter "${PACKAGE_NAME}_${VERSION}_${ARCH}/etc/cron.d/"
+          cp packaging/DEBIAN/conffiles "${PACKAGE_NAME}_${VERSION}_${ARCH}/DEBIAN/"
+
+      - name: Create Debian control file
+        run: |
+          cat > "${PACKAGE_NAME}_${VERSION}_${ARCH}/DEBIAN/control" << EOF
+          Package: startcloud-scripts-dev
+          Version: ${VERSION}
+          Section: admin
+          Priority: optional
+          Architecture: ${ARCH}
+          Maintainer: Makr91 <makr91@users.noreply.github.com>
+          Depends: ksh93u+m, zfsutils-linux
+          Conflicts: startcloud-scripts
+          Description: STARTcloud Scripts (Development) - ZFS snapshot rotation for Proxmox hosts
+           Installs Snapshoter.sh, a ksh script that takes a ZFS snapshot from
+           cron and keeps only a set number of them, with a cron.d template.
+           This is a development version.
+          Homepage: https://github.com/STARTcloud/startcloud-scripts
+          EOF
+
+      - name: Set Debian package permissions
+        run: |
+          find "${PACKAGE_NAME}_${VERSION}_${ARCH}" -type d -exec chmod 755 {} \;
+          find "${PACKAGE_NAME}_${VERSION}_${ARCH}" -type f -exec chmod 644 {} \;
+          chmod 755 "${PACKAGE_NAME}_${VERSION}_${ARCH}/opt/prominic/bin"/*
+
+      - name: Build Debian package
+        run: |
+          dpkg-deb --build "${PACKAGE_NAME}_${VERSION}_${ARCH}" "${PACKAGE_NAME}_${VERSION}_${ARCH}.deb"
+
+      - name: Upload Debian package to repository server
+        run: |
+          rsync -av ${PACKAGE_NAME}_*.deb startcloud@debian.startcloud.com:/tmp/
+
+      - name: Add package to repository pool
+        run: |
+          ssh startcloud@debian.startcloud.com "
+            mkdir -p /local/public/debian/pool/main/s/startcloud-scripts-dev
+            cp /tmp/${PACKAGE_NAME}_*.deb /local/public/debian/pool/main/s/startcloud-scripts-dev/
+          "
+
+      - name: Update repository Packages files for all suites
+        run: |
+          ssh startcloud@debian.startcloud.com "
+            cd /local/public/debian
+            for suite in bookworm trixie; do
+              dpkg-scanpackages --arch amd64 pool/ > dists/\$suite/main/binary-amd64/Packages
+              gzip -c dists/\$suite/main/binary-amd64/Packages > dists/\$suite/main/binary-amd64/Packages.gz
+            done
+          "
+
+      - name: Generate Release files for all suites
+        run: |
+          ssh startcloud@debian.startcloud.com "
+            cd /local/public/debian
+            for suite in bookworm trixie; do
+              cd dists/\$suite
+              /local/generate-release.sh \$suite > Release
+              cd ../..
+            done
+          "
+
+      - name: Create stable distribution with proper Release file
+        run: |
+          ssh startcloud@debian.startcloud.com "
+            cd /local/public/debian/dists
+            rm -rf stable 2>/dev/null || true
+            cp -r trixie stable
+            cd stable
+            /local/generate-release.sh stable > Release
+          "
+
+      - name: Sign repository for all suites including stable
+        run: |
+          ssh startcloud@debian.startcloud.com "
+            cd /local/public/debian
+            for suite in bookworm trixie stable; do
+              cd dists/\$suite
+              export GNUPGHOME=\$(mktemp -d /local/pgp/pgpkeys-XXXXXX)
+              cat /local/pgp/pgp-key.private | gpg --import
+              cat Release | gpg --default-key startcloud -abs > Release.gpg
+              cat Release | gpg --default-key startcloud -abs --clearsign > InRelease
+              rm -rf \$GNUPGHOME
+              cd ../..
+            done
+          "
+
+      - name: Create development pre-release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          RELEASE_TAG="v${VERSION}-dev"
+          RELEASE_TITLE="v${VERSION}-dev"
+          RELEASE_NOTES="🚧 **Development Release** 🚧
+
+          This is an automated development build from the main branch.
+
+          **Version**: ${VERSION}
+          **Build Date**: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+          **Commit**: ${{ github.sha }}
+
+          ⚠️ **Warning**: This is a development release for testing purposes only. Use production releases for stable deployments.
+
+          ## Packages
+          - \`startcloud-scripts-dev_${VERSION}_amd64.deb\` - Debian package"
+
+          gh release delete "$RELEASE_TAG" --yes --cleanup-tag || true
+
+          gh release create "$RELEASE_TAG" --prerelease --target "${{ github.sha }}" --title "$RELEASE_TITLE" --notes "$RELEASE_NOTES"
+
+      - name: Upload development packages to release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          RELEASE_TAG="v${VERSION}-dev"
+
+          gh release upload "$RELEASE_TAG" "${PACKAGE_NAME}_${VERSION}_${ARCH}.deb" --clobber
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: 'development-packages'
+          path: |
+            *.deb
+          retention-days: 30
+
+      - name: Clean up
+        run: |
+          ssh startcloud@debian.startcloud.com "rm -f /tmp/${PACKAGE_NAME}_*.deb"
+
+      - name: Summary
+        run: |
+          echo "Development packages built and published:"
+          echo "- Version: ${VERSION}"
+          echo "- Debian package: ${PACKAGE_NAME}_${VERSION}_${ARCH}.deb"
+          echo "- Pre-release: v${VERSION}-dev"
+          echo "- Packages published to repositories"

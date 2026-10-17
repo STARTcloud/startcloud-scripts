@@ -1,0 +1,192 @@
+name: Production Build
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: 'Version to build'
+        required: true
+        type: string
+      tag_name:
+        description: 'GitHub release tag'
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to build'
+        required: true
+        type: string
+      tag_name:
+        description: 'GitHub release tag'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-production-packages:
+    name: Packages
+    runs-on: self-hosted
+    steps:
+      - name: Checkout for Debian build
+        uses: actions/checkout@v7
+
+      - name: Set Debian package variables
+        run: |
+          echo "VERSION=${{ inputs.version }}" >> $GITHUB_ENV
+          echo "PACKAGE_NAME=startcloud-scripts" >> $GITHUB_ENV
+          echo "ARCH=amd64" >> $GITHUB_ENV
+          echo "TAG_NAME=${{ inputs.tag_name }}" >> $GITHUB_ENV
+
+      - name: Create Debian package structure
+        run: |
+          mkdir -p "${PACKAGE_NAME}_${VERSION}_${ARCH}"/{opt/prominic/bin,etc/cron.d,DEBIAN}
+
+      - name: Copy application files to Debian package
+        run: |
+          cp src/Snapshoter.sh "${PACKAGE_NAME}_${VERSION}_${ARCH}/opt/prominic/bin/"
+
+      - name: Copy configuration files to Debian package
+        run: |
+          cp packaging/cron/snapshoter "${PACKAGE_NAME}_${VERSION}_${ARCH}/etc/cron.d/"
+          cp packaging/DEBIAN/conffiles "${PACKAGE_NAME}_${VERSION}_${ARCH}/DEBIAN/"
+
+      - name: Create Debian control file
+        run: |
+          cat > "${PACKAGE_NAME}_${VERSION}_${ARCH}/DEBIAN/control" << EOF
+          Package: startcloud-scripts
+          Version: ${VERSION}
+          Section: admin
+          Priority: optional
+          Architecture: ${ARCH}
+          Maintainer: Makr91 <makr91@users.noreply.github.com>
+          Depends: ksh93u+m, zfsutils-linux
+          Description: STARTcloud Scripts - ZFS snapshot rotation for Proxmox hosts
+           Installs Snapshoter.sh, a ksh script that takes a ZFS snapshot from
+           cron and keeps only a set number of them, with a cron.d template.
+          Homepage: https://github.com/STARTcloud/startcloud-scripts
+          EOF
+
+      - name: Set Debian package permissions
+        run: |
+          find "${PACKAGE_NAME}_${VERSION}_${ARCH}" -type d -exec chmod 755 {} \;
+          find "${PACKAGE_NAME}_${VERSION}_${ARCH}" -type f -exec chmod 644 {} \;
+          chmod 755 "${PACKAGE_NAME}_${VERSION}_${ARCH}/opt/prominic/bin"/*
+
+      - name: Build Debian package
+        run: |
+          dpkg-deb --build "${PACKAGE_NAME}_${VERSION}_${ARCH}" "${PACKAGE_NAME}_${VERSION}_${ARCH}.deb"
+
+      - name: Install GitHub CLI
+        run: |
+          if ! command -v gh &> /dev/null; then
+            curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+            sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
+            echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+            sudo apt update
+            sudo apt install gh -y
+          fi
+
+      - name: Upload Debian package to release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload ${{ github.event.inputs.tag_name || env.TAG_NAME }} "${PACKAGE_NAME}_${VERSION}_${ARCH}.deb" --clobber
+
+      - name: Generate and upload SHA256SUMS
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          sha256sum "${PACKAGE_NAME}_${VERSION}_${ARCH}.deb" > SHA256SUMS.txt
+          gh release upload "${{ github.event.inputs.tag_name || env.TAG_NAME }}" SHA256SUMS.txt --clobber
+
+      - name: Generate and upload update-info.json
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ github.event.inputs.tag_name || env.TAG_NAME }}"
+          DL="https://github.com/${{ github.repository }}/releases/download/${TAG}"
+          NOTES="$(gh release view "${TAG}" --json body --jq .body | jq -Rs .)"
+          cat > update-info.json << EOF
+          {
+            "version": "${VERSION}",
+            "releaseUrl": "https://github.com/${{ github.repository }}/releases/tag/${TAG}",
+            "releaseDate": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "changelog": "https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md",
+            "releaseNotes": ${NOTES},
+            "linuxUrl": "${DL}/${PACKAGE_NAME}_${VERSION}_${ARCH}.deb",
+            "checksumsUrl": "${DL}/SHA256SUMS.txt"
+          }
+          EOF
+          gh release upload "${TAG}" update-info.json --clobber
+
+      - name: Upload Debian package to repository server
+        run: |
+          rsync -av startcloud-scripts_*.deb startcloud@debian.startcloud.com:/tmp/
+
+      - name: Add package to repository pool
+        run: |
+          ssh startcloud@debian.startcloud.com "
+            mkdir -p /local/public/debian/pool/main/s/startcloud-scripts
+            cp /tmp/startcloud-scripts_*.deb /local/public/debian/pool/main/s/startcloud-scripts/
+          "
+
+      - name: Create multi-suite directory structure
+        run: |
+          ssh startcloud@debian.startcloud.com "
+            cd /local/public/debian
+            mkdir -p dists/bookworm/main/binary-amd64
+            mkdir -p dists/trixie/main/binary-amd64
+          "
+
+      - name: Update repository Packages files for all suites
+        run: |
+          ssh startcloud@debian.startcloud.com "
+            cd /local/public/debian
+            for suite in bookworm trixie; do
+              dpkg-scanpackages --arch amd64 pool/ > dists/\$suite/main/binary-amd64/Packages
+              gzip -c dists/\$suite/main/binary-amd64/Packages > dists/\$suite/main/binary-amd64/Packages.gz
+            done
+          "
+
+      - name: Generate Release files for all suites
+        run: |
+          ssh startcloud@debian.startcloud.com "
+            cd /local/public/debian
+            for suite in bookworm trixie; do
+              cd dists/\$suite
+              /local/generate-release.sh \$suite > Release
+              cd ../..
+            done
+          "
+
+      - name: Create stable distribution with proper Release file
+        run: |
+          ssh startcloud@debian.startcloud.com "
+            cd /local/public/debian/dists
+            rm -rf stable 2>/dev/null || true
+            cp -r trixie stable
+            cd stable
+            /local/generate-release.sh stable > Release
+          "
+
+      - name: Sign repository for all suites including stable
+        run: |
+          ssh startcloud@debian.startcloud.com "
+            cd /local/public/debian
+            for suite in bookworm trixie stable; do
+              cd dists/\$suite
+              export GNUPGHOME=\$(mktemp -d /local/pgp/pgpkeys-XXXXXX)
+              cat /local/pgp/pgp-key.private | gpg --import
+              cat Release | gpg --default-key startcloud -abs > Release.gpg
+              cat Release | gpg --default-key startcloud -abs --clearsign > InRelease
+              rm -rf \$GNUPGHOME
+              cd ../..
+            done
+          "
+
+      - name: Cleanup temporary files
+        run: |
+          ssh startcloud@debian.startcloud.com "rm -f /tmp/startcloud-scripts_*.deb"

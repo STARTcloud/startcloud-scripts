@@ -1,0 +1,7 @@
+.claude/
+notifications.md
+*.deb
+startcloud-scripts_*/
+startcloud-scripts-dev_*/
+SHA256SUMS.txt
+update-info.json

@@ -1,0 +1,14 @@
+# Snapshoter.sh schedule template. Uncomment the lines for the pools this host carries.
+# hourly keeps 24, daily keeps 8, weekly keeps 5; -r recurses into every child dataset.
+#
+#0 1-23 * * *   root /opt/prominic/bin/Snapshoter.sh -p hourly -r -n 24 Array-0/vms
+#0 0    * * 0-5 root /opt/prominic/bin/Snapshoter.sh -p daily  -r -n 8  Array-0/vms
+#0 0    * * 6   root /opt/prominic/bin/Snapshoter.sh -p weekly -r -n 5  Array-0/vms
+#
+#0 1-23 * * *   root /opt/prominic/bin/Snapshoter.sh -p hourly -r -n 24 Array-1/vms
+#0 0    * * 0-5 root /opt/prominic/bin/Snapshoter.sh -p daily  -r -n 8  Array-1/vms
+#0 0    * * 6   root /opt/prominic/bin/Snapshoter.sh -p weekly -r -n 5  Array-1/vms
+#
+#0 1-23 * * *   root /opt/prominic/bin/Snapshoter.sh -p hourly -r -n 24 Array-2/vms
+#0 0    * * 0-5 root /opt/prominic/bin/Snapshoter.sh -p daily  -r -n 8  Array-2/vms
+#0 0    * * 6   root /opt/prominic/bin/Snapshoter.sh -p weekly -r -n 5  Array-2/vms
